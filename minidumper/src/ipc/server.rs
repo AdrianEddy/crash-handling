@@ -519,61 +519,68 @@ impl Server {
 
                                     cfg_if::cfg_if! {
                                         if #[cfg(any(target_os = "linux", target_os = "android"))] {
-                                            let peer_creds = cc.socket.0.initial_peer_credentials()?;
+                                            let crash_ctx = cc.socket.0.initial_peer_credentials().map_err(Error::from).and_then(|peer_creds| {
+                                                let crash_ctx = crash_context::CrashContext::from_bytes(&buffer).ok_or_else(|| {
+                                                    Error::from(std::io::Error::new(
+                                                        std::io::ErrorKind::InvalidData,
+                                                        "client sent an incorrectly sized buffer",
+                                                    ))
+                                                })?;
 
-                                            let pid = peer_creds.pid().ok_or(Error::UnknownClientPid)?;
-
-                                            let crash_ctx = crash_context::CrashContext::from_bytes(&buffer).ok_or_else(|| {
-                                                Error::from(std::io::Error::new(
-                                                    std::io::ErrorKind::InvalidData,
-                                                    "client sent an incorrectly sized buffer",
-                                                ))
-                                            })?;
-
-                                            // Validate that the crash info and the socket agree on the pid
-                                            if pid.get() != crash_ctx.pid as u32 {
-                                                return Err(Error::UnknownClientPid);
-                                            }
+                                                // Validate that the crash info and the socket agree on the pid
+                                                if peer_creds.pid().map(std::num::NonZeroU32::get) == Some(crash_ctx.pid as u32) {
+                                                    Ok(crash_ctx)
+                                                } else {
+                                                    Err(Error::UnknownClientPid)
+                                                }
+                                            });
                                         } else if #[cfg(target_os = "windows")] {
                                             use scroll::Pread;
-                                            let dump_request: super::DumpRequest = buffer.pread(0)?;
 
-                                            // MiniDumpWriteDump primarily uses `EXCEPTION_POINTERS` for its crash
-                                            // context information, but inside that is an `EXCEPTION_RECORD`, which
-                                            // is an internally linked list, so rather than recurse and allocate until
-                                            // the end of that linked list, we just retrieve the actual pointer from
-                                            // the client process, and inform the dump writer that they are pointers
-                                            // to a different process, as MiniDumpWriteDump will internally read
-                                            // the processes memory as needed
-                                            let exception_pointers = dump_request.exception_pointers as *const crash_context::EXCEPTION_POINTERS;
+                                            let crash_ctx = buffer.pread::<super::DumpRequest>(0).map(|dump_request| {
+                                                // MiniDumpWriteDump primarily uses `EXCEPTION_POINTERS` for its crash
+                                                // context information, but inside that is an `EXCEPTION_RECORD`, which
+                                                // is an internally linked list, so rather than recurse and allocate until
+                                                // the end of that linked list, we just retrieve the actual pointer from
+                                                // the client process, and inform the dump writer that they are pointers
+                                                // to a different process, as MiniDumpWriteDump will internally read
+                                                // the processes memory as needed
+                                                let exception_pointers = dump_request.exception_pointers as *const crash_context::EXCEPTION_POINTERS;
 
-                                            let crash_ctx = crash_context::CrashContext {
-                                                exception_pointers,
-                                                process_id: dump_request.process_id,
-                                                thread_id: dump_request.thread_id,
-                                                exception_code: dump_request.exception_code,
-                                            };
+                                                crash_context::CrashContext {
+                                                    exception_pointers,
+                                                    process_id: dump_request.process_id,
+                                                    thread_id: dump_request.thread_id,
+                                                    exception_code: dump_request.exception_code,
+                                                }
+                                            });
                                         }
                                     }
 
-                                    let action =
-                                        match Self::handle_crash_request(crash_ctx, handler.as_ref()) {
-                                            Err(err) => {
-                                                log::error!("failed to capture minidump: {err}");
-                                                LoopAction::Continue
-                                            }
-                                            Ok(action) => {
-                                                log::info!("captured minidump");
-                                                action
-                                            }
-                                        };
-
-                                    let ack = Header {
-                                        kind: super::CRASH_ACK,
-                                        size: 0,
+                                    // A request the server can't take is answered as a
+                                    // minidump not written, and ends only its connection
+                                    let (written, action) = match crash_ctx {
+                                        Ok(crash_ctx) => {
+                                            Self::handle_crash_request(crash_ctx, handler.as_ref())
+                                        }
+                                        Err(err) => {
+                                            log::error!("client sent a crash request the server can't take: {err}");
+                                            (false, LoopAction::Continue)
+                                        }
                                     };
 
-                                    if let Err(err) = send_reply(&cc.socket, ack.as_bytes()) {
+                                    // The ack says whether the minidump was written
+                                    let mut ack = [0u8; std::mem::size_of::<Header>() + 1];
+                                    ack[..std::mem::size_of::<Header>()].copy_from_slice(
+                                        Header {
+                                            kind: super::CRASH_ACK,
+                                            size: 1,
+                                        }
+                                        .as_bytes(),
+                                    );
+                                    ack[std::mem::size_of::<Header>()] = u8::from(written);
+
+                                    if let Err(err) = send_reply(&cc.socket, &ack) {
                                         log::error!("failed to send ack: {err}");
                                     }
 
@@ -702,11 +709,19 @@ impl Server {
         }
     }
 
+    /// Writes the minidump a client asked for, and returns whether it was
+    /// written, and what the [`crate::ServerHandler`] wants the loop to do next
     fn handle_crash_request(
         crash_context: crash_context::CrashContext,
         handler: &dyn crate::ServerHandler,
-    ) -> Result<LoopAction, Error> {
-        let (mut minidump_file, minidump_path) = handler.create_minidump_file()?;
+    ) -> (bool, LoopAction) {
+        let (mut minidump_file, minidump_path) = match handler.create_minidump_file() {
+            Ok(created) => created,
+            Err(err) => {
+                log::error!("failed to create the minidump file: {err}");
+                return (false, LoopAction::Continue);
+            }
+        };
 
         cfg_if::cfg_if! {
             if #[cfg(any(target_os = "linux", target_os = "android"))] {
@@ -734,8 +749,15 @@ impl Server {
             }
         }
 
+        match &result {
+            Ok(_) => log::info!("captured minidump"),
+            Err(err) => log::error!("failed to capture minidump: {err}"),
+        }
+
+        let written = result.is_ok();
+
         // Notify the user handler about the minidump, even if we failed to write it
-        Ok(handler.on_minidump_created(
+        let action = handler.on_minidump_created(
             result
                 .map(|_contents| crate::MinidumpBinary {
                     file: minidump_file,
@@ -746,7 +768,9 @@ impl Server {
                     contents: Some(_contents),
                 })
                 .map_err(crate::Error::from),
-        ))
+        );
+
+        (written, action)
     }
 
     /// Serves the crash context of the client at `pos`, whose pid is `pid`,
@@ -771,18 +795,13 @@ impl Server {
         remove_client(poll, clients, pos);
 
         if let Some(mut rcc) = crash {
-            let action = match Self::handle_crash_request(rcc.crash_context, handler) {
-                Err(err) => {
-                    log::error!("failed to capture minidump: {err}");
-                    LoopAction::Continue
-                }
-                Ok(action) => {
-                    log::info!("captured minidump");
-                    action
-                }
-            };
+            let (written, action) = Self::handle_crash_request(rcc.crash_context, handler);
 
-            if let Err(err) = rcc.acker.send_ack(1, Some(Duration::from_secs(2))) {
+            // The ack says whether the minidump was written
+            if let Err(err) = rcc
+                .acker
+                .send_ack(u32::from(written), Some(Duration::from_secs(2)))
+            {
                 log::error!("failed to send ack: {err}");
             }
 

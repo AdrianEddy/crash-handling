@@ -39,6 +39,10 @@ pub trait ServerHandler: Send + Sync {
     ///
     /// A return value of true indicates that the message loop should exit and
     /// stop processing messages.
+    ///
+    /// The client's [`crate::Client::request_dump`] learns whether the minidump
+    /// was written, from `result`, once this returns. It isn't called if
+    /// [`Self::create_minidump_file`] fails, which the client learns as well.
     fn on_minidump_created(&self, result: Result<MinidumpBinary, Error>) -> LoopAction;
     /// Called when the client sends a user message sent from the client with
     /// `send_message`

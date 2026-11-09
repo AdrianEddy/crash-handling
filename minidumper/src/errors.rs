@@ -46,6 +46,10 @@ pub enum Error {
     /// connection out of step with the server, so it can't be used any more
     #[error("the connection is out of step with the server after an earlier call failed")]
     ConnectionBroken,
+    /// The server acknowledged a crash request, but couldn't write its
+    /// minidump: the file couldn't be created, or the minidump writer failed
+    #[error("the server couldn't write the minidump")]
+    DumpFailed,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

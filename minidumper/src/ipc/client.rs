@@ -220,7 +220,8 @@ impl Client {
     /// # Errors
     ///
     /// The request can't be sent, or the server's acknowledgement doesn't come,
-    /// within this client's [`ClientTimeouts`] if it has them
+    /// within this client's [`ClientTimeouts`] if it has them, or the server
+    /// couldn't write the minidump, which is [`Error::DumpFailed`]
     pub fn request_dump(&self, crash_context: &crash_context::CrashContext) -> Result<(), Error> {
         cfg_if::cfg_if! {
             if #[cfg(any(target_os = "linux", target_os = "android"))] {
@@ -244,11 +245,11 @@ impl Client {
                 // is coming, and this also orders it after every message sent
                 // before it over the socket
                 self.send_message_impl(super::MACH_CRASH, &[])?;
-                self.call(|| {
+                let written = self.call(|| {
                     let (send, recv) = self.mach_timeouts;
 
                     match self.port.send_crash_context(crash_context, Some(send), Some(recv)) {
-                        Ok(Some(_ack)) => Ok(()),
+                        Ok(Some(ack)) => Ok(ack != 0),
                         // The server's port stayed full, or its acknowledgement
                         // didn't come
                         Ok(None) | Err(crash_context::ipc::Error::Message(MACH_SEND_TIMED_OUT)) => {
@@ -256,7 +257,9 @@ impl Client {
                         }
                         Err(err) => Err(err.into()),
                     }
-                })
+                })?;
+
+                if written { Ok(()) } else { Err(Error::DumpFailed) }
             }
         }
 
@@ -265,19 +268,28 @@ impl Client {
             self.send_message_impl(super::CRASH, crash_ctx_buffer)?;
 
             // Wait for the server to send back an ack that it has finished
-            // with the crash context
-            self.call(|| {
-                let mut ack = [0u8; std::mem::size_of::<Header>()];
+            // with the crash context, and whether it wrote the minidump
+            let written = self.call(|| {
+                let mut ack = [0u8; std::mem::size_of::<Header>() + 1];
                 self.recv_reply(&mut ack)?;
 
-                let header = Header::from_bytes(&ack);
+                let (header, written) = ack.split_at(std::mem::size_of::<Header>());
 
-                if header.filter(|hdr| hdr.kind == super::CRASH_ACK).is_none() {
+                if Header::from_bytes(header)
+                    .filter(|hdr| hdr.kind == super::CRASH_ACK && hdr.size == 1)
+                    .is_none()
+                {
                     return Err(Error::ProtocolError("received invalid response to crash"));
                 }
 
+                Ok(written[0] != 0)
+            })?;
+
+            if written {
                 Ok(())
-            })
+            } else {
+                Err(Error::DumpFailed)
+            }
         }
     }
 

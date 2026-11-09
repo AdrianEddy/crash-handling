@@ -1214,3 +1214,130 @@ fn timeout_under_a_millisecond_is_refused() {
         );
     }
 }
+
+/// Tests that a client learns when the server couldn't write the minidump it
+/// asked for, here because its file couldn't be created, where the
+/// acknowledgement used to read the same as for a minidump written
+#[test]
+fn failed_dump_is_reported() {
+    struct NoFile;
+
+    impl minidumper::ServerHandler for NoFile {
+        fn create_minidump_file(
+            &self,
+        ) -> Result<(std::fs::File, std::path::PathBuf), std::io::Error> {
+            Err(std::io::Error::other("no room for a minidump"))
+        }
+
+        fn on_minidump_created(
+            &self,
+            _result: Result<minidumper::MinidumpBinary, minidumper::Error>,
+        ) -> minidumper::LoopAction {
+            panic!("should not be called without a file");
+        }
+
+        fn on_message(&self, _kind: u32, _buffer: Vec<u8>) {}
+    }
+
+    let name = minidumper::SocketName::path("failed_dump_is_reported");
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let returned = spawn_server(server, Box::new(NoFile), None);
+
+    // A context of this very process, which never crashed: the server gives
+    // up on it before it reads any of it
+    cfg_if::cfg_if! {
+        if #[cfg(any(target_os = "linux", target_os = "android"))] {
+            let mut context = crash_context::CrashContext::from_bytes(
+                &[0; std::mem::size_of::<crash_context::CrashContext>()],
+            )
+            .unwrap();
+            // The server checks it against the socket's peer
+            context.pid = std::process::id() as libc::pid_t;
+        } else if #[cfg(target_os = "windows")] {
+            let context = crash_context::CrashContext {
+                exception_pointers: std::ptr::null(),
+                exception_code: 0,
+                process_id: std::process::id(),
+                thread_id: 0,
+            };
+        } else if #[cfg(target_os = "macos")] {
+            // The server pairs the task with the connection by its pid
+            let context = own_crash_context();
+        }
+    }
+
+    let client = minidumper::Client::with_name(name).unwrap();
+    assert!(
+        matches!(
+            client.request_dump(&context),
+            Err(minidumper::Error::DumpFailed)
+        ),
+        "the server says it wrote no minidump"
+    );
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+}
+
+/// Tests that a Linux crash request the server can't take, whose body isn't a
+/// crash context or whose crash context is another process's than the
+/// connection's, is answered as a minidump not written and closes only its
+/// connection, where it used to end the server loop
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn invalid_crash_request_is_answered_as_not_written() {
+    /// The wire kinds of a crash request and of its acknowledgement
+    const CRASH: u32 = 0;
+    const CRASH_ACK: u32 = 1;
+
+    let path = std::path::Path::new("invalid_crash_request");
+    let name = minidumper::SocketName::Path(path);
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let returned = spawn_server(server, Box::new(NoCrashes), None);
+
+    // The acknowledgement's header, and its verdict: not written
+    let mut not_written = CRASH_ACK.to_ne_bytes().to_vec();
+    not_written.extend_from_slice(&1u32.to_ne_bytes());
+    not_written.push(0);
+
+    for body in [
+        // Too short for a crash context
+        vec![0u8; 4],
+        // A crash context of process 0, which isn't the connection's
+        vec![0u8; std::mem::size_of::<crash_context::CrashContext>()],
+    ] {
+        let mut packet = CRASH.to_ne_bytes().to_vec();
+        packet.extend_from_slice(&(body.len() as u32).to_ne_bytes());
+        packet.extend_from_slice(&body);
+
+        let raw = uds::UnixSeqpacketConn::connect(path).unwrap();
+        // A server that never answers fails the test rather than hang it
+        raw.set_read_timeout(Some(RETURN_LIMIT)).unwrap();
+        raw.send(&packet).unwrap();
+
+        let mut ack = [0u8; 16];
+        let len = raw.recv(&mut ack).unwrap();
+        assert_eq!(
+            ack[..len],
+            not_written[..],
+            "the server answers that it wrote no minidump"
+        );
+        assert_eq!(raw.recv(&mut ack).unwrap(), 0, "and closes the connection");
+    }
+
+    let client = minidumper::Client::with_name(name).unwrap();
+    client
+        .ping()
+        .expect("the server still serves other clients");
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+}
