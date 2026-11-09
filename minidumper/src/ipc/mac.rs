@@ -155,14 +155,44 @@ impl Uds {
         }
     }
 
-    fn recv_with_flags(&self, buf: &mut [u8], flags: i32) -> io::Result<usize> {
-        // SAFETY: syscall
-        let read = unsafe { libc::recv(self.0, buf.as_mut_ptr().cast(), buf.len(), flags) };
-
-        if read == -1 {
-            Err(io::Error::last_os_error())
+    /// Sets an `int` socket option
+    fn set_int(&self, option: i32, value: libc::c_int) -> io::Result<()> {
+        // SAFETY: syscall, given an int as the option's value
+        if unsafe {
+            libc::setsockopt(
+                self.0,
+                libc::SOL_SOCKET,
+                option,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } == 0
+        {
+            Ok(())
         } else {
-            Ok(read as usize)
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Reads an `int` socket option
+    fn int(&self, option: i32) -> io::Result<libc::c_int> {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+        // SAFETY: syscall, given room for an int as the option's value
+        if unsafe {
+            libc::getsockopt(
+                self.0,
+                libc::SOL_SOCKET,
+                option,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        } == 0
+        {
+            Ok(value)
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -288,8 +318,29 @@ impl UnixStream {
     }
 
     #[inline]
-    pub(crate) fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.recv_with_flags(buf, libc::MSG_PEEK)
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.0.set_nonblocking(nonblocking)
+    }
+
+    /// Has the kernel write each send whole, however many threads send at once,
+    /// and returns the largest send it then keeps whole: `largest`, unless the
+    /// system caps socket buffers lower (`kern.ipc.maxsockbuf`).
+    ///
+    /// A blocking send on a stream socket writes what fits once the buffer has
+    /// room for its low-water mark (2KiB by default), and waits for room for
+    /// the rest without the buffer's lock, so another thread's send can land
+    /// in between. With the low-water mark at the buffer's size, XNU's
+    /// `sosendcheck` waits until all of a send fits, writing none of it
+    /// before, and then writes it in one pass under the lock. A Unix domain
+    /// socket's peer takes whatever comes, so this buffer's size, set first to
+    /// `largest`, is the most in flight, and caps the low-water mark.
+    pub(crate) fn keep_writes_whole(&self, largest: usize) -> io::Result<usize> {
+        let largest = libc::c_int::try_from(largest).unwrap_or(libc::c_int::MAX);
+        self.0.set_int(libc::SO_SNDBUF, largest)?;
+        self.0.set_int(libc::SO_SNDLOWAT, largest)?;
+
+        usize::try_from(self.0.int(libc::SO_SNDLOWAT)?)
+            .map_err(|_err| io::Error::from(io::ErrorKind::InvalidData))
     }
 
     #[inline]

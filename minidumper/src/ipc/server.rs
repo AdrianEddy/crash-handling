@@ -78,41 +78,180 @@ struct ClientConn {
     /// the socket, after the messages sent before it
     #[cfg(target_os = "macos")]
     mach_crash: Option<crash_context::ipc::ReceivedCrashContext>,
+    /// The message read so far, as a stream socket can deliver one in pieces
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    partial: Partial,
+}
+
+/// What reading from a client connection gave
+enum Recv {
+    /// A whole message: its kind and its body
+    Message(u32, Vec<u8>),
+    /// The rest of the message hasn't arrived yet
+    Pending,
+    /// The client closed the connection, or it failed, or the client broke the
+    /// protocol
+    Closed,
+}
+
+/// A message read in part from a stream socket
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+enum Partial {
+    /// The header, and how much of it has been read
+    Header([u8; std::mem::size_of::<Header>()], usize),
+    /// The message's kind, its body, and how much of the body has been read
+    Body(u32, Vec<u8>, usize),
 }
 
 impl ClientConn {
-    fn recv(&mut self, handler: &dyn crate::ServerHandler) -> Option<(u32, Vec<u8>)> {
-        use std::io::IoSliceMut;
+    fn new(socket: Connection, key: usize) -> Self {
+        Self {
+            socket,
+            key,
+            last_update: Instant::now(),
+            #[cfg(target_os = "macos")]
+            pid: None,
+            #[cfg(target_os = "macos")]
+            mach_crash: None,
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            partial: Partial::Header([0; std::mem::size_of::<Header>()], 0),
+        }
+    }
+
+    /// Reads the next message. A sequenced-packet socket delivers a message
+    /// whole, in a single read, so a read of any other length breaks the
+    /// protocol.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn recv(&mut self, handler: &dyn crate::ServerHandler) -> Recv {
+        use std::io::{ErrorKind, IoSliceMut};
 
         let mut hdr_buf = [0u8; std::mem::size_of::<Header>()];
-        cfg_if::cfg_if! {
-            if #[cfg(any(target_os = "linux", target_os = "android"))] {
-                let len = self.socket.0.peek(&mut hdr_buf).ok()?;
-            } else {
-                let len = self.socket.peek(&mut hdr_buf).ok()?;
+        let len = match self.socket.0.peek(&mut hdr_buf) {
+            Ok(0) => return Recv::Closed,
+            Ok(len) => len,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => return Recv::Pending,
+            Err(err) => {
+                log::error!("failed to read from client: {err}");
+                return Recv::Closed;
+            }
+        };
+
+        let Some(header) = Header::from_bytes(&hdr_buf[..len]) else {
+            log::error!("client sent a message shorter than a header");
+            return Recv::Closed;
+        };
+
+        // Never allocated, whatever the header claims
+        if header.size as usize > super::MAX_MESSAGE_SIZE {
+            log::error!("client sent a header claiming {} bytes", header.size);
+            return Recv::Closed;
+        }
+
+        let mut buffer = handler.message_alloc();
+        buffer.resize(header.size as usize, 0);
+
+        match self
+            .socket
+            .recv_vectored(&mut [IoSliceMut::new(&mut hdr_buf), IoSliceMut::new(&mut buffer)])
+        {
+            Ok((read, false)) if read == hdr_buf.len() + buffer.len() => {
+                Recv::Message(header.kind, buffer)
+            }
+            Ok(_) => {
+                log::error!("client sent a message whose size doesn't match its header");
+                Recv::Closed
+            }
+            Err(err) => {
+                log::error!("failed to read from client: {err}");
+                Recv::Closed
             }
         }
+    }
 
-        if len == 0 {
-            return None;
+    /// Reads the next message, or what has arrived of it. A stream socket
+    /// delivers a message in as many pieces as it likes, so what has been read
+    /// is kept until the rest arrives, and nothing past the message is read.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn recv(&mut self, handler: &dyn crate::ServerHandler) -> Recv {
+        use std::io::ErrorKind;
+        use std::ops::ControlFlow;
+
+        /// Reads into `buf[*read..]` until it is full, or breaks with what
+        /// `recv` returns when the rest hasn't arrived yet or the connection
+        /// is done
+        fn fill(socket: &Connection, buf: &mut [u8], read: &mut usize) -> ControlFlow<Recv> {
+            while *read < buf.len() {
+                match socket.recv(&mut buf[*read..]) {
+                    Ok(0) => return ControlFlow::Break(Recv::Closed),
+                    Ok(len) => *read += len,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        return ControlFlow::Break(Recv::Pending);
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    Err(err) => {
+                        log::error!("failed to read from client: {err}");
+                        return ControlFlow::Break(Recv::Closed);
+                    }
+                }
+            }
+
+            ControlFlow::Continue(())
         }
 
-        let header = Header::from_bytes(&hdr_buf)?;
+        loop {
+            match &mut self.partial {
+                Partial::Header(header, read) => {
+                    if let ControlFlow::Break(recv) = fill(&self.socket, header, read) {
+                        return recv;
+                    }
 
-        if header.size == 0 {
-            self.socket.recv(&mut hdr_buf).ok()?;
-            Some((header.kind, Vec::new()))
-        } else {
-            let mut buffer = handler.message_alloc();
+                    let header = Header::from_array(header);
 
-            buffer.resize(header.size as usize, 0);
+                    // Never allocated, whatever the header claims, and the
+                    // stream can't be read past a message of the wrong size
+                    if header.size as usize > super::MAX_MESSAGE_SIZE {
+                        log::error!("client sent a header claiming {} bytes", header.size);
+                        return Recv::Closed;
+                    }
 
-            self.socket
-                .recv_vectored(&mut [IoSliceMut::new(&mut hdr_buf), IoSliceMut::new(&mut buffer)])
-                .ok()?;
+                    let mut buffer = handler.message_alloc();
+                    buffer.resize(header.size as usize, 0);
+                    self.partial = Partial::Body(header.kind, buffer, 0);
+                }
+                Partial::Body(kind, buffer, read) => {
+                    if let ControlFlow::Break(recv) = fill(&self.socket, buffer, read) {
+                        return recv;
+                    }
 
-            Some((header.kind, buffer))
+                    let message = Recv::Message(*kind, std::mem::take(buffer));
+                    self.partial = Partial::Header([0; std::mem::size_of::<Header>()], 0);
+                    return message;
+                }
+            }
         }
+    }
+}
+
+/// The server loop must never block on a client. A Linux listener's accepted
+/// connections are non-blocking already, while elsewhere whether an accepted
+/// socket takes the listener's mode differs by OS.
+fn nonblocking(conn: Connection) -> std::io::Result<Connection> {
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    conn.set_nonblocking(true)?;
+
+    Ok(conn)
+}
+
+/// Sends a whole reply on a non-blocking socket, which a client always has
+/// room for, as it waits for each reply before it asks for another
+fn send_reply(socket: &Connection, reply: &[u8]) -> std::io::Result<()> {
+    if socket.send(reply)? == reply.len() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "the reply was cut short",
+        ))
     }
 }
 
@@ -320,23 +459,19 @@ impl Server {
 
             for event in events.iter() {
                 if event.key == 0 {
-                    match polling.listener.accept_unix_addr() {
-                        Ok((accepted, _addr)) => {
+                    match polling
+                        .listener
+                        .accept_unix_addr()
+                        .and_then(|(accepted, _addr)| nonblocking(accepted))
+                    {
+                        Ok(accepted) => {
                             let key = id;
                             id += 1;
 
                             polling.add(&accepted, Event::readable(key))?;
 
                             log::debug!("accepted connection {key}");
-                            polling.clients.push(ClientConn {
-                                socket: accepted,
-                                key,
-                                last_update: Instant::now(),
-                                #[cfg(target_os = "macos")]
-                                pid: None,
-                                #[cfg(target_os = "macos")]
-                                mach_crash: None,
-                            });
+                            polling.clients.push(ClientConn::new(accepted, key));
 
                             if handler.on_client_connected(polling.clients.len())
                                 == LoopAction::Exit
@@ -359,18 +494,26 @@ impl Server {
                     // The connection, if this message ended it, out of the list
                     // and the poller already
                     let removed = match polling.clients[pos].recv(handler.as_ref()) {
-                        Some((super::CRASH, buffer)) => {
+                        Recv::Message(super::CRASH, buffer) => {
                             cfg_if::cfg_if! {
                                 if #[cfg(target_os = "macos")] {
                                     use scroll::Pread;
-                                    let pid: u32 = buffer.pread(0)?;
-                                    polling.clients[pos].pid = Some(pid);
 
-                                    if let Err(err) = polling.clients[pos].socket.send(&[1]) {
-                                        log::error!("failed to send ack: {err}");
+                                    match buffer.pread::<u32>(0) {
+                                        Ok(pid) => {
+                                            polling.clients[pos].pid = Some(pid);
+
+                                            if let Err(err) = send_reply(&polling.clients[pos].socket, &[1]) {
+                                                log::error!("failed to send ack: {err}");
+                                            }
+
+                                            None
+                                        }
+                                        Err(err) => {
+                                            log::error!("client sent no pid: {err}");
+                                            Some(remove_client(polling.poll, &mut polling.clients, pos))
+                                        }
                                     }
-
-                                    None
                                 } else {
                                     let cc = remove_client(polling.poll, &mut polling.clients, pos);
 
@@ -430,7 +573,7 @@ impl Server {
                                         size: 0,
                                     };
 
-                                    if let Err(err) = cc.socket.send(ack.as_bytes()) {
+                                    if let Err(err) = send_reply(&cc.socket, ack.as_bytes()) {
                                         log::error!("failed to send ack: {err}");
                                     }
 
@@ -444,7 +587,7 @@ impl Server {
                             }
                         }
                         #[cfg(target_os = "macos")]
-                        Some((super::MACH_CRASH, _buffer)) => {
+                        Recv::Message(super::MACH_CRASH, _buffer) => {
                             // The crash context itself comes over the mach port,
                             // which is only read once a client says one is coming,
                             // and is paired with the client by its pid
@@ -469,13 +612,15 @@ impl Server {
                             log::error!("client announced a crash context before its pid");
                             Some(remove_client(polling.poll, &mut polling.clients, pos))
                         }
-                        Some((super::PING, _buffer)) => {
+                        Recv::Message(super::PING, _buffer) => {
                             let pong = Header {
                                 kind: super::PONG,
                                 size: 0,
                             };
 
-                            if let Err(err) = polling.clients[pos].socket.send(pong.as_bytes()) {
+                            if let Err(err) =
+                                send_reply(&polling.clients[pos].socket, pong.as_bytes())
+                            {
                                 log::error!("failed to send PONG: {err}");
 
                                 Some(remove_client(polling.poll, &mut polling.clients, pos))
@@ -483,21 +628,25 @@ impl Server {
                                 None
                             }
                         }
-                        Some((super::PONG, _buffer)) => None,
-                        Some((kind, buffer)) => {
-                            handler.on_message(
-                                kind - super::USER, /* give the user back the original code they specified */
-                                buffer,
-                            );
+                        Recv::Message(super::PONG, _buffer) => None,
+                        Recv::Message(kind, buffer) => {
+                            /* give the user back the original code they specified */
+                            if let Some(kind) = kind.checked_sub(super::USER) {
+                                handler.on_message(kind, buffer);
 
-                            // We only send acks for crash dump requests
-                            // if let Err(e) = clients[pos].socket.send(&[1]) {
-                            //     log::error!("failed to send ack: {}", e);
-                            // }
+                                // We only send acks for crash dump requests
+                                // if let Err(e) = clients[pos].socket.send(&[1]) {
+                                //     log::error!("failed to send ack: {}", e);
+                                // }
 
-                            None
+                                None
+                            } else {
+                                log::error!("client sent a message of unknown kind {kind}");
+                                Some(remove_client(polling.poll, &mut polling.clients, pos))
+                            }
                         }
-                        None => {
+                        Recv::Pending => None,
+                        Recv::Closed => {
                             log::debug!("client closed socket {pos}");
                             Some(remove_client(polling.poll, &mut polling.clients, pos))
                         }

@@ -35,11 +35,6 @@ cfg_if::cfg_if! {
             }
 
             #[inline]
-            fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-                self.0.recv(buf)
-            }
-
-            #[inline]
             fn recv_vectored(&self, buf: &mut [std::io::IoSliceMut<'_>]) -> Result<(usize, bool), std::io::Error> {
                 self.0.recv_vectored(buf)
             }
@@ -148,6 +143,13 @@ const PONG: u32 = 3;
 const MACH_CRASH: u32 = 4;
 const USER: u32 = 5;
 
+/// The largest message body, in bytes, that a [`Client`] sends and a
+/// [`Server`] takes. [`Client::send_message`] refuses a larger message before
+/// sending any of it, and the server closes a connection whose message header
+/// claims more, rather than allocate whatever a header claims. Every message
+/// the crate itself sends is far smaller.
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
 /// A socket name.
 ///
 /// Linux, Windows, and Macos can all use a file path as the name for the socket.
@@ -209,13 +211,16 @@ impl Header {
     }
 
     fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() != std::mem::size_of::<Self>() {
-            return None;
-        }
+        buf.try_into().ok().map(Self::from_array)
+    }
 
-        #[allow(unsafe_code)]
-        unsafe {
-            Some(std::ptr::read_unaligned(buf.as_ptr().cast::<Self>()))
+    /// The header whose bytes, in [`Self::as_bytes`]'s order, are `buf`
+    fn from_array(buf: &[u8; std::mem::size_of::<Self>()]) -> Self {
+        let [k0, k1, k2, k3, s0, s1, s2, s3] = *buf;
+
+        Self {
+            kind: u32::from_ne_bytes([k0, k1, k2, k3]),
+            size: u32::from_ne_bytes([s0, s1, s2, s3]),
         }
     }
 }

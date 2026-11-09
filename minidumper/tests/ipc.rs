@@ -467,6 +467,11 @@ fn broken_crash_protocol_closes_connection() {
         closes(wire_message(MACH_CRASH_KIND, &[])),
         "a word that a crash context is coming, before the client's pid"
     );
+    assert!(
+        closes(wire_message(PID_KIND, &[0; 2])),
+        "a pid two bytes short"
+    );
+
     let client = minidumper::Client::with_name(name).unwrap();
     client
         .ping()
@@ -668,4 +673,388 @@ fn mach_service_before_socket() {
     );
 
     drop(first);
+}
+
+/// The messages a [`Record`] was sent, with their kinds
+type Messages = Arc<parking_lot::Mutex<Vec<(u32, Vec<u8>)>>>;
+
+/// A handler that keeps every message it is sent
+struct Record(Messages);
+
+impl minidumper::ServerHandler for Record {
+    fn create_minidump_file(&self) -> Result<(std::fs::File, std::path::PathBuf), std::io::Error> {
+        panic!("should not be called");
+    }
+
+    fn on_minidump_created(
+        &self,
+        _result: Result<minidumper::MinidumpBinary, minidumper::Error>,
+    ) -> minidumper::LoopAction {
+        panic!("should not be called");
+    }
+
+    fn on_message(&self, kind: u32, buffer: Vec<u8>) {
+        self.0.lock().push((kind, buffer));
+    }
+}
+
+/// Tests that messages far larger than a socket's buffer arrive whole and in
+/// order, however the socket delivers them: macOS's stream socket has an 8KiB
+/// buffer, and Windows' is a stream too
+#[test]
+fn large_messages_arrive_whole() {
+    let name = minidumper::SocketName::path("large_messages_arrive_whole");
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let returned = spawn_server(server, Box::new(Record(messages.clone())), None);
+
+    let large: Vec<u8> = (0..48 * 1024).map(|i| (i % 251) as u8).collect();
+    let expected: Vec<(u32, Vec<u8>)> = (0..6)
+        .map(|kind| {
+            let body = if kind % 2 == 0 {
+                large.clone()
+            } else {
+                b"small".to_vec()
+            };
+            (kind, body)
+        })
+        .collect();
+
+    let client = minidumper::Client::with_name(name).unwrap();
+    for (kind, body) in &expected {
+        client.send_message(*kind, body).unwrap();
+    }
+    // The server answers once it has read everything sent before
+    client.ping().unwrap();
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+
+    assert!(*messages.lock() == expected, "every message arrives whole");
+}
+
+/// Tests that a message a stream socket delivers in pieces, header included,
+/// is read whole, and that what follows it is read as the next message
+#[cfg(target_os = "macos")]
+#[test]
+fn message_in_pieces() {
+    use std::io::Write;
+
+    let path = std::path::Path::new("message_in_pieces");
+    let name = minidumper::SocketName::Path(path);
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let returned = spawn_server(server, Box::new(Record(messages.clone())), None);
+
+    /// The message kinds the client sends start here, as `Client::send_message`'s do
+    const USER: u32 = 5;
+
+    let frame = |kind: u32, body: &[u8]| {
+        let mut frame = (kind + USER).to_ne_bytes().to_vec();
+        frame.extend_from_slice(&(body.len() as u32).to_ne_bytes());
+        frame.extend_from_slice(body);
+        frame
+    };
+
+    let mut bytes = frame(7, b"in pieces");
+    bytes.extend(frame(8, b"after"));
+
+    let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+    for piece in [&bytes[..3], &bytes[3..10], &bytes[10..14], &bytes[14..]] {
+        stream.write_all(piece).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let started = std::time::Instant::now();
+    while messages.lock().len() < 2 {
+        assert!(
+            started.elapsed() < RETURN_LIMIT,
+            "both messages should arrive"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(stream);
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+
+    assert!(
+        *messages.lock() == [(7, b"in pieces".to_vec()), (8, b"after".to_vec())],
+        "the message is read whole, and the next one after it"
+    );
+}
+
+/// Tests that a sequenced-packet message whose size doesn't match its header
+/// closes that connection, and that the server goes on serving others
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn mismatched_message_closes_connection() {
+    let path = std::path::Path::new("mismatched_message_closes_connection");
+    let name = minidumper::SocketName::Path(path);
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let returned = spawn_server(server, Box::new(Record(messages.clone())), None);
+
+    // A header that says 100 bytes, and a 4 byte body
+    let mut packet = 5u32.to_ne_bytes().to_vec();
+    packet.extend_from_slice(&100u32.to_ne_bytes());
+    packet.extend_from_slice(b"oops");
+
+    let raw = uds::UnixSeqpacketConn::connect(path).unwrap();
+    raw.send(&packet).unwrap();
+    assert_eq!(
+        raw.recv(&mut [0; 8]).unwrap(),
+        0,
+        "the server closes the connection"
+    );
+
+    let client = minidumper::Client::with_name(name).unwrap();
+    client
+        .ping()
+        .expect("the server still serves other clients");
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+
+    assert!(messages.lock().is_empty(), "no message was delivered");
+}
+
+/// Tests that messages sent from two threads at once on one client arrive
+/// whole: each is as large as a message can be, larger than a socket's default
+/// buffer, and the server reads slowly, so sends wait for room while another
+/// thread's are waiting too. On a stream socket (macOS, Windows) a send that
+/// waits part way could let another thread's message in.
+#[test]
+fn concurrent_messages_arrive_whole() {
+    /// Keeps every message it is sent, slowly
+    struct SlowRecord(Messages);
+
+    impl minidumper::ServerHandler for SlowRecord {
+        fn create_minidump_file(
+            &self,
+        ) -> Result<(std::fs::File, std::path::PathBuf), std::io::Error> {
+            panic!("should not be called");
+        }
+
+        fn on_minidump_created(
+            &self,
+            _result: Result<minidumper::MinidumpBinary, minidumper::Error>,
+        ) -> minidumper::LoopAction {
+            panic!("should not be called");
+        }
+
+        fn on_message(&self, kind: u32, buffer: Vec<u8>) {
+            // The socket fills up meanwhile
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.0.lock().push((kind, buffer));
+        }
+    }
+
+    /// How many messages each thread sends
+    const PER_THREAD: usize = 4;
+
+    let name = minidumper::SocketName::path("concurrent_messages_arrive_whole");
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let returned = spawn_server(server, Box::new(SlowRecord(messages.clone())), None);
+
+    let client = minidumper::Client::with_name(name).unwrap();
+
+    // Each thread sends messages of its own kind, filled with that byte
+    std::thread::scope(|scope| {
+        for kind in [1u8, 2] {
+            let client = &client;
+            scope.spawn(move || {
+                for _ in 0..PER_THREAD {
+                    client
+                        .send_message(kind.into(), vec![kind; minidumper::MAX_MESSAGE_SIZE])
+                        .unwrap();
+                }
+            });
+        }
+    });
+    // The server answers once it has read everything sent before
+    client.ping().unwrap();
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+
+    let messages = messages.lock();
+    assert_eq!(messages.len(), 2 * PER_THREAD, "every message arrives");
+    for (kind, body) in messages.iter() {
+        assert!(
+            body.len() == minidumper::MAX_MESSAGE_SIZE
+                && body.iter().all(|byte| u32::from(*byte) == *kind),
+            "a message of kind {kind} arrives whole"
+        );
+    }
+}
+
+/// Tests that a message larger than `MAX_MESSAGE_SIZE` is refused before any
+/// of it is sent, which leaves the connection usable, and that a message of
+/// that size arrives whole
+#[test]
+fn oversized_message_is_refused() {
+    let name = minidumper::SocketName::path("oversized_message_is_refused");
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let returned = spawn_server(server, Box::new(Record(messages.clone())), None);
+
+    let client = minidumper::Client::with_name(name).unwrap();
+    assert!(matches!(
+        client.send_message(1, vec![1; minidumper::MAX_MESSAGE_SIZE + 1]),
+        Err(minidumper::Error::ProtocolError(_))
+    ));
+    client
+        .send_message(2, vec![2; minidumper::MAX_MESSAGE_SIZE])
+        .unwrap();
+    client.ping().unwrap();
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+
+    assert!(
+        *messages.lock() == [(2, vec![2; minidumper::MAX_MESSAGE_SIZE])],
+        "only the message within the limit is sent, and it arrives whole"
+    );
+}
+
+/// A raw Windows `AF_UNIX` client, for what [`minidumper::Client`] never sends
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+mod raw_windows {
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn socket(af: i32, kind: i32, protocol: i32) -> usize;
+        fn connect(socket: usize, name: *const u8, len: i32) -> i32;
+        fn setsockopt(socket: usize, level: i32, name: i32, value: *const u8, len: i32) -> i32;
+        fn send(socket: usize, buf: *const u8, len: i32, flags: i32) -> i32;
+        fn recv(socket: usize, buf: *mut u8, len: i32, flags: i32) -> i32;
+        fn closesocket(socket: usize) -> i32;
+    }
+
+    /// Connects to `path`, which a server in this process listens on, sends
+    /// `bytes`, and returns whether the server then closes the connection,
+    /// waiting at most `limit` for it
+    pub fn send_and_see_closed(path: &str, bytes: &[u8], limit: std::time::Duration) -> bool {
+        const AF_UNIX: i32 = 1;
+        const SOCK_STREAM: i32 = 1;
+        const INVALID_SOCKET: usize = !0;
+        const SOL_SOCKET: i32 = 0xffff;
+        const SO_RCVTIMEO: i32 = 0x1006;
+
+        // A `sockaddr_un`: the family, then the path, NUL-terminated
+        let mut addr = [0u8; 2 + 108];
+        addr[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+        addr[2..2 + path.len()].copy_from_slice(path.as_bytes());
+        let limit = u32::try_from(limit.as_millis()).unwrap();
+
+        // SAFETY: syscalls, each given buffers of the lengths it is told; the
+        // server's start has initialized Winsock
+        unsafe {
+            let socket = socket(AF_UNIX, SOCK_STREAM, 0);
+            assert_ne!(socket, INVALID_SOCKET);
+            assert_eq!(connect(socket, addr.as_ptr(), addr.len() as i32), 0);
+            assert_eq!(
+                setsockopt(
+                    socket,
+                    SOL_SOCKET,
+                    SO_RCVTIMEO,
+                    (&limit as *const u32).cast(),
+                    4
+                ),
+                0
+            );
+            assert_eq!(
+                send(socket, bytes.as_ptr(), bytes.len() as i32, 0),
+                bytes.len() as i32
+            );
+
+            let mut buf = [0u8; 8];
+            let read = recv(socket, buf.as_mut_ptr(), buf.len() as i32, 0);
+            closesocket(socket);
+            read == 0
+        }
+    }
+}
+
+/// Tests that a message whose header claims more than `MAX_MESSAGE_SIZE`
+/// closes its connection, without the server allocating what it claims, and
+/// that the server goes on serving others. The claim is one byte over the
+/// limit, not gigabytes, so that a server without the limit would allocate
+/// only that much.
+#[test]
+fn oversized_header_closes_connection() {
+    let path = std::path::Path::new("oversized_header_closes_connection");
+    let name = minidumper::SocketName::Path(path);
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let returned = spawn_server(server, Box::new(Record(messages.clone())), None);
+
+    /// The wire kind of the first user message
+    const USER: u32 = 5;
+
+    let mut message = USER.to_ne_bytes().to_vec();
+    message.extend_from_slice(&(minidumper::MAX_MESSAGE_SIZE as u32 + 1).to_ne_bytes());
+
+    cfg_if::cfg_if! {
+        if #[cfg(any(target_os = "linux", target_os = "android"))] {
+            // A sequenced packet holds the whole message, as a client sends it
+            message.resize(message.len() + minidumper::MAX_MESSAGE_SIZE + 1, 0);
+
+            let raw = uds::UnixSeqpacketConn::connect(path).unwrap();
+            // A server that never closes it fails the test rather than hang it
+            raw.set_read_timeout(Some(RETURN_LIMIT)).unwrap();
+            raw.send(&message).unwrap();
+            let closed = raw.recv(&mut [0; 8]).unwrap() == 0;
+        } else if #[cfg(target_os = "macos")] {
+            use std::io::{Read, Write};
+
+            // A stream is closed on the header alone
+            let mut raw = std::os::unix::net::UnixStream::connect(path).unwrap();
+            raw.set_read_timeout(Some(RETURN_LIMIT)).unwrap();
+            raw.write_all(&message).unwrap();
+            let closed = raw.read(&mut [0; 8]).unwrap() == 0;
+        } else if #[cfg(target_os = "windows")] {
+            // A stream is closed on the header alone
+            let closed =
+                raw_windows::send_and_see_closed(path.to_str().unwrap(), &message, RETURN_LIMIT);
+        }
+    }
+    assert!(closed, "the server closes the connection");
+
+    let client = minidumper::Client::with_name(name).unwrap();
+    client
+        .ping()
+        .expect("the server still serves other clients");
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+
+    assert!(messages.lock().is_empty(), "no message was delivered");
 }

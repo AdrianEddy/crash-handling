@@ -43,7 +43,6 @@ mod bindings {
     pub type SOCKET = usize;
 
     pub type SEND_RECV_FLAGS = i32;
-    pub const MSG_PEEK: SEND_RECV_FLAGS = 2;
 
     #[repr(C)]
     pub struct OVERLAPPED_0_0 {
@@ -80,6 +79,7 @@ mod bindings {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub fn SetHandleInformation(hObject: HANDLE, dwMask: u32, dwFlags: HANDLE_FLAGS) -> BOOL;
+        pub fn GetCurrentThreadId() -> u32;
     }
 
     #[link(name = "ws2_32")]
@@ -130,6 +130,13 @@ pub(crate) fn init() {
         // when it tries to call `WSAStartup` a second time.
         drop(std::net::UdpSocket::bind("127.0.0.1:0"));
     });
+}
+
+/// The calling thread's id, which is never 0
+#[inline]
+pub(crate) fn current_thread_id() -> u32 {
+    // SAFETY: no preconditions, it reads the thread's own environment block
+    unsafe { bindings::GetCurrentThreadId() }
 }
 
 #[inline]
@@ -466,8 +473,8 @@ impl UnixStream {
     }
 
     #[inline]
-    pub(crate) fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.recv_with_flags(buf, bindings::MSG_PEEK)
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.0.set_nonblocking(nonblocking)
     }
 
     #[inline]
