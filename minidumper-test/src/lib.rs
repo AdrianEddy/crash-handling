@@ -70,23 +70,21 @@ impl fmt::Display for Signal {
 
 use std::{
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Mutex, mpsc},
 };
 
 pub struct Server {
     pub id: String,
     pub dump_rx: mpsc::Receiver<PathBuf>,
-    exit_run_loop: Arc<AtomicBool>,
+    exit_run_loop: minidumper::ShutdownHandle,
     run_loop: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.exit_run_loop.store(true, Ordering::Relaxed);
+        self.exit_run_loop
+            .shutdown()
+            .expect("failed to wake the server thread");
         if let Some(jh) = self.run_loop.take() {
             jh.join().expect("failed to join server thread");
         }
@@ -162,12 +160,11 @@ pub fn spinup_server(id: &str, dump_path: Option<PathBuf>) -> Server {
         dump_path,
     };
 
-    let exit = Arc::new(AtomicBool::new(false));
-    let exit_run_loop = exit.clone();
+    let exit_run_loop = server.shutdown_handle();
 
     let run_loop = std::thread::spawn(move || {
         server
-            .run(Box::new(inner), &exit, None)
+            .run(Box::new(inner), None)
             .expect("failed to run server loop");
     });
 

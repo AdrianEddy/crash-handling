@@ -494,6 +494,7 @@ dependencies = [
  "crash-handler",
  "libc",
  "log",
+ "mach2",
  "minidump-writer",
  "parking_lot",
  "polling",

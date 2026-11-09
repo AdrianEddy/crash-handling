@@ -135,14 +135,18 @@ mod client;
 mod server;
 
 pub use client::Client;
-pub use server::Server;
+pub use server::{Server, ShutdownHandle};
 
 const CRASH: u32 = 0;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const CRASH_ACK: u32 = 1;
 const PING: u32 = 2;
 const PONG: u32 = 3;
-const USER: u32 = 4;
+/// Macos: the client's crash context is on its way over the mach port, which
+/// the server reads only when told so
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MACH_CRASH: u32 = 4;
+const USER: u32 = 5;
 
 /// A socket name.
 ///

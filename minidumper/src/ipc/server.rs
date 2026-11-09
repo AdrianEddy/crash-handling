@@ -1,13 +1,25 @@
 use super::{Connection, Header, Listener, SocketName};
 use crate::{Error, LoopAction};
-use polling::{Event, Poller};
-use std::io::ErrorKind;
+use polling::{Event, Events, Poller};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
+
+/// How long the server waits for a crash context on the mach port once a
+/// client has said that it is on its way. The client sends it right after
+/// saying so, so this only runs out if the client died or was stopped in
+/// between, or its mach send failed.
+#[cfg(target_os = "macos")]
+const MACH_CRASH_WAIT: Duration = Duration::from_secs(5);
 
 /// Server side of the connection, which runs in the monitor process that is
 /// meant to monitor the process where the [`super::Client`] resides
 pub struct Server {
     listener: Option<Listener>,
+    /// What [`Self::run`] waits on, shared with every [`ShutdownHandle`]
+    waker: Arc<Waker>,
     #[cfg(target_os = "macos")]
     port: crash_context::ipc::Server,
     /// For abstract sockets, we don't have to worry about cleanup as it is
@@ -17,6 +29,36 @@ pub struct Server {
     /// may need to harden this code if people experience issues with socket
     /// paths not being cleaned up reliably
     socket_path: Option<std::path::PathBuf>,
+}
+
+/// The poller the server loop waits on, and whether the loop has been told to
+/// stop
+struct Waker {
+    poller: Poller,
+    shutdown: AtomicBool,
+}
+
+/// Stops a [`Server`]'s message loop from any thread, see [`Server::shutdown_handle`]
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    waker: Arc<Waker>,
+}
+
+impl ShutdownHandle {
+    /// Tells [`Server::run`] to return, waking it if it is waiting for a
+    /// message. A message being handled is finished first, so a minidump being
+    /// written is never cut short. Once this is called, `run` returns at once,
+    /// whenever it is called.
+    ///
+    /// # Errors
+    ///
+    /// The server loop could not be woken. The loop still returns the next time
+    /// it wakes for a message.
+    pub fn shutdown(&self) -> Result<(), Error> {
+        self.waker.shutdown.store(true, Ordering::Release);
+        self.waker.poller.notify()?;
+        Ok(())
+    }
 }
 
 struct ClientConn {
@@ -30,6 +72,12 @@ struct ClientConn {
     /// to drop when a crash is received on the mach port
     #[cfg(target_os = "macos")]
     pid: Option<u32>,
+    /// This client's crash context, if it came over the mach port while the
+    /// server waited for another client's, before this client's own word that
+    /// it was coming was read: served once that word is, which is already in
+    /// the socket, after the messages sent before it
+    #[cfg(target_os = "macos")]
+    mach_crash: Option<crash_context::ipc::ReceivedCrashContext>,
 }
 
 impl ClientConn {
@@ -68,6 +116,19 @@ impl ClientConn {
     }
 }
 
+/// Takes the connection at `pos` out of `clients`, deleting its socket from
+/// the poller as it leaves, as [`Poller::add`] requires before the socket is
+/// dropped
+fn remove_client(poll: &Poller, clients: &mut Vec<ClientConn>, pos: usize) -> ClientConn {
+    let cc = clients.swap_remove(pos);
+
+    if let Err(err) = poll.delete(&cc.socket) {
+        log::error!("failed to deregister socket: {err}");
+    }
+
+    cc
+}
+
 impl Server {
     /// Creates a new server with the given name.
     ///
@@ -92,6 +153,12 @@ impl Server {
         } else {
             None
         };
+
+        // Before the socket is bound, so a failure here leaves no socket behind
+        let waker = Arc::new(Waker {
+            poller: Poller::new()?,
+            shutdown: AtomicBool::new(false),
+        });
 
         cfg_if::cfg_if! {
             if #[cfg(any(target_os = "linux", target_os = "android"))] {
@@ -126,14 +193,29 @@ impl Server {
 
         Ok(Self {
             listener: Some(listener),
+            waker,
             #[cfg(target_os = "macos")]
             port,
             socket_path,
         })
     }
 
+    /// A handle that stops [`Self::run`] from another thread, such as one that
+    /// learns that the monitored process has exited. [`Self::run`] waits for
+    /// messages without a timeout, so this is how it learns to stop, other than
+    /// a [`LoopAction::Exit`] from the [`crate::ServerHandler`].
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            waker: self.waker.clone(),
+        }
+    }
+
     /// Runs the server loop, accepting client connections and receiving IPC
-    /// messages.
+    /// messages, until a [`crate::ServerHandler`] method returns
+    /// [`LoopAction::Exit`] or [`ShutdownHandle::shutdown`] is called.
+    ///
+    /// The loop sleeps until a client connects or sends a message, or a
+    /// [`ShutdownHandle`] wakes it, and wakes up for nothing else.
     ///
     /// If `stale_timeout` is specified, client connections that have not sent
     /// a message within that period will be shutdown and removed, to prevent
@@ -144,7 +226,9 @@ impl Server {
     /// Sending messages will prevent the connection from going stale, but if
     /// messages are not guaranteed to be sent at a higher frequency than your
     /// specified timeout, you can use [`crate::Client::ping`] to fill in any
-    /// message gaps to indicate the client is still alive.
+    /// message gaps to indicate the client is still alive. The loop then also
+    /// wakes up when the connection that sent a message the longest time ago
+    /// goes stale.
     ///
     /// # Errors
     ///
@@ -154,23 +238,22 @@ impl Server {
     pub fn run(
         &mut self,
         handler: Box<dyn crate::ServerHandler>,
-        shutdown: &std::sync::atomic::AtomicBool,
-        stale_timeout: Option<std::time::Duration>,
+        stale_timeout: Option<Duration>,
     ) -> Result<(), Error> {
-        let mut events = polling::Events::new();
+        let mut events = Events::new();
         let listener = self.listener.take().unwrap();
 
-        struct Poll {
+        struct Poll<'p> {
             listener: Listener,
             clients: Vec<ClientConn>,
-            poll: Poller,
+            poll: &'p Poller,
         }
 
-        impl Poll {
-            fn new(listener: Listener) -> std::io::Result<Self> {
+        impl<'p> Poll<'p> {
+            fn new(listener: Listener, poll: &'p Poller) -> std::io::Result<Self> {
                 let s = Self {
                     listener,
-                    poll: Poller::new()?,
+                    poll,
                     clients: Vec::new(),
                 };
 
@@ -188,12 +271,22 @@ impl Server {
                 src: impl polling::AsRawSource,
                 interest: Event,
             ) -> std::io::Result<()> {
-                // SAFETY: We ensure we delete all sources we add before dropping the poll
+                // SAFETY: Every connection is deleted as it leaves `clients`
+                // (`remove_client`, the stale reaper), and `drop` deletes the
+                // ones left
                 unsafe { self.poll.add(src, interest) }
+            }
+
+            /// How long until the connection that sent a message the longest
+            /// time ago goes stale, if there is a connection
+            fn until_stale(&self, stale_timeout: Duration) -> Option<Duration> {
+                let oldest = self.clients.iter().map(|cc| cc.last_update).min()?;
+                let stale_at = oldest.checked_add(stale_timeout)?;
+                Some(stale_at.saturating_duration_since(Instant::now()))
             }
         }
 
-        impl Drop for Poll {
+        impl Drop for Poll<'_> {
             fn drop(&mut self) {
                 for client in std::mem::take(&mut self.clients) {
                     if let Err(err) = self.poll.delete(client.socket) {
@@ -207,39 +300,20 @@ impl Server {
             }
         }
 
-        let mut polling = Poll::new(listener)?;
+        let mut polling = Poll::new(listener, &self.waker.poller)?;
         let mut id = 1;
 
         loop {
-            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.waker.shutdown.load(Ordering::Acquire) {
                 return Ok(());
             }
 
             events.clear();
-            let timeout = Duration::from_millis(10);
-            let deadline = Instant::now() + timeout;
-            let mut remaining = Some(timeout);
-            while let Some(timeout) = remaining {
-                match polling.poll.wait(&mut events, Some(timeout)) {
-                    Ok(_) => {
-                        break;
-                    }
-                    Err(e) => {
-                        if matches!(e.kind(), ErrorKind::Interrupted) {
-                            remaining = deadline.checked_duration_since(Instant::now());
-                        } else {
-                            return Err(e.into());
-                        }
-                    }
-                }
-            }
-
-            #[cfg(target_os = "macos")]
-            if self.check_mach_port(&polling.poll, &mut polling.clients, handler.as_ref())?
-                == LoopAction::Exit
-            {
-                return Ok(());
-            }
+            // Without a stale timeout, or a connection to go stale, nothing but
+            // a connection, a message or a shutdown wakes the loop. The wait
+            // retries an interrupted call itself.
+            let timeout = stale_timeout.and_then(|st| polling.until_stale(st));
+            polling.poll.wait(&mut events, timeout)?;
 
             for event in events.iter() {
                 if event.key == 0 {
@@ -257,6 +331,8 @@ impl Server {
                                 last_update: Instant::now(),
                                 #[cfg(target_os = "macos")]
                                 pid: None,
+                                #[cfg(target_os = "macos")]
+                                mach_crash: None,
                             });
 
                             if handler.on_client_connected(polling.clients.len())
@@ -277,7 +353,9 @@ impl Server {
                 {
                     polling.clients[pos].last_update = Instant::now();
 
-                    let deregister = match polling.clients[pos].recv(handler.as_ref()) {
+                    // The connection, if this message ended it, out of the list
+                    // and the poller already
+                    let removed = match polling.clients[pos].recv(handler.as_ref()) {
                         Some((super::CRASH, buffer)) => {
                             cfg_if::cfg_if! {
                                 if #[cfg(target_os = "macos")] {
@@ -291,7 +369,7 @@ impl Server {
 
                                     None
                                 } else {
-                                    let cc = polling.clients.swap_remove(pos);
+                                    let cc = remove_client(polling.poll, &mut polling.clients, pos);
 
                                     cfg_if::cfg_if! {
                                         if #[cfg(any(target_os = "linux", target_os = "android"))] {
@@ -358,9 +436,35 @@ impl Server {
                                         return Ok(());
                                     }
 
-                                    Some(cc.socket)
+                                    Some(cc)
                                 }
                             }
+                        }
+                        #[cfg(target_os = "macos")]
+                        Some((super::MACH_CRASH, _buffer)) => {
+                            // The crash context itself comes over the mach port,
+                            // which is only read once a client says one is coming,
+                            // and is paired with the client by its pid
+                            if let Some(pid) = polling.clients[pos].pid {
+                                if Self::serve_mach_crash(
+                                    &mut self.port,
+                                    polling.poll,
+                                    &mut polling.clients,
+                                    pos,
+                                    pid,
+                                    handler.as_ref(),
+                                )? == LoopAction::Exit
+                                {
+                                    return Ok(());
+                                }
+
+                                // The connection that asked has been served, or
+                                // given up on, and removed
+                                continue;
+                            }
+
+                            log::error!("client announced a crash context before its pid");
+                            Some(remove_client(polling.poll, &mut polling.clients, pos))
                         }
                         Some((super::PING, _buffer)) => {
                             let pong = Header {
@@ -371,8 +475,7 @@ impl Server {
                             if let Err(err) = polling.clients[pos].socket.send(pong.as_bytes()) {
                                 log::error!("failed to send PONG: {err}");
 
-                                let cc = polling.clients.swap_remove(pos);
-                                Some(cc.socket)
+                                Some(remove_client(polling.poll, &mut polling.clients, pos))
                             } else {
                                 None
                             }
@@ -393,16 +496,11 @@ impl Server {
                         }
                         None => {
                             log::debug!("client closed socket {pos}");
-                            let cc = polling.clients.swap_remove(pos);
-                            Some(cc.socket)
+                            Some(remove_client(polling.poll, &mut polling.clients, pos))
                         }
                     };
 
-                    if let Some(socket) = deregister {
-                        if let Err(err) = polling.poll.delete(&socket) {
-                            log::error!("failed to deregister socket: {err}");
-                        }
-
+                    if removed.is_some() {
                         if handler.on_client_disconnected(polling.clients.len()) == LoopAction::Exit
                         {
                             log::debug!("on_client_disconnected exited message loop");
@@ -423,6 +521,13 @@ impl Server {
                 // Reap any connections that haven't sent a message in the period
                 // specified by the user
                 polling.clients.retain(|conn| {
+                    // A crash context kept for its client's word that it is
+                    // coming, which is in the socket already, keeps its client
+                    #[cfg(target_os = "macos")]
+                    if conn.mach_crash.is_some() {
+                        return true;
+                    }
+
                     let keep = conn.last_update.elapsed() < st;
 
                     if !keep {
@@ -492,26 +597,28 @@ impl Server {
         ))
     }
 
+    /// Serves the crash context of the client at `pos`, whose pid is `pid`,
+    /// once it has said over its socket that the context is on its way over
+    /// the mach port, and removes the client, as a crash does on the other
+    /// platforms. A client whose crash context doesn't come in time is given
+    /// up on, and removed all the same.
     #[cfg(target_os = "macos")]
-    fn check_mach_port(
-        &mut self,
+    fn serve_mach_crash(
+        port: &mut crash_context::ipc::Server,
         poll: &Poller,
         clients: &mut Vec<ClientConn>,
+        pos: usize,
+        pid: u32,
         handler: &dyn crate::ServerHandler,
     ) -> Result<LoopAction, Error> {
-        // We use a really short timeout for receiving on the mach port since we check it
-        // frequently rather than spawning a separate thread and blocking
-        if let Some(mut rcc) = self
-            .port
-            .try_recv_crash_context(Some(Duration::from_millis(1)))?
-        {
-            // Try to find a client connection that matches the port sender
-            let pos = clients
-                .iter()
-                .position(|cc| cc.pid == Some(rcc.pid))
-                .ok_or(Error::UnknownClientPid)?;
-            let cc = clients.swap_remove(pos);
+        let crash = match clients[pos].mach_crash.take() {
+            Some(rcc) => Some(rcc),
+            None => Self::recv_mach_crash(port, clients, pid)?,
+        };
 
+        remove_client(poll, clients, pos);
+
+        if let Some(mut rcc) = crash {
             let action = match Self::handle_crash_request(rcc.crash_context, handler) {
                 Err(err) => {
                     log::error!("failed to capture minidump: {err}");
@@ -527,13 +634,74 @@ impl Server {
                 log::error!("failed to send ack: {err}");
             }
 
-            if let Err(err) = poll.delete(&cc.socket) {
-                log::error!("failed to deregister socket: {err}");
+            if action == LoopAction::Exit {
+                log::debug!("user handler requested exit after minidump creation");
+                return Ok(LoopAction::Exit);
+            }
+        }
+
+        if handler.on_client_disconnected(clients.len()) == LoopAction::Exit {
+            log::debug!("on_client_disconnected exited message loop");
+            return Ok(LoopAction::Exit);
+        }
+
+        Ok(LoopAction::Continue)
+    }
+
+    /// Receives crash contexts from the mach port until the one of the client
+    /// whose pid is `pid` comes, or none has within [`MACH_CRASH_WAIT`].
+    ///
+    /// Another client's crash context that comes first is kept on that
+    /// client's connection, to be served once its own word that it is coming
+    /// is read, after the messages it sent before: that word is in its socket
+    /// already, as a client sends it first. A crash context that no connection
+    /// can take is answered as not written, and one whose task is gone, as
+    /// when its process died after sending it, is dropped.
+    #[cfg(target_os = "macos")]
+    fn recv_mach_crash(
+        port: &mut crash_context::ipc::Server,
+        clients: &mut [ClientConn],
+        pid: u32,
+    ) -> Result<Option<crash_context::ipc::ReceivedCrashContext>, Error> {
+        let deadline = Instant::now() + MACH_CRASH_WAIT;
+
+        loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            let mut rcc = match port.try_recv_crash_context(Some(wait)) {
+                Ok(Some(rcc)) => rcc,
+                Ok(None) => {
+                    log::error!("client {pid} announced a crash but sent no crash context");
+                    return Ok(None);
+                }
+                // The message has been taken off the port, but its task has no
+                // pid, as when its process died after sending it
+                Err(crash_context::ipc::Error::Kernel(err)) => {
+                    log::error!("received a crash context whose task has no pid: {err}");
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            if rcc.pid == pid {
+                return Ok(Some(rcc));
             }
 
-            Ok(action)
-        } else {
-            Ok(LoopAction::Continue)
+            if let Some(cc) = clients
+                .iter_mut()
+                .find(|cc| cc.pid == Some(rcc.pid) && cc.mach_crash.is_none())
+            {
+                cc.mach_crash = Some(rcc);
+            } else {
+                log::error!(
+                    "received a crash context from process {} with no connection",
+                    rcc.pid
+                );
+
+                // No minidump is written for it
+                if let Err(err) = rcc.acker.send_ack(0, Some(Duration::from_secs(2))) {
+                    log::error!("failed to send ack: {err}");
+                }
+            }
         }
     }
 }

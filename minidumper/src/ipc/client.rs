@@ -114,6 +114,10 @@ impl Client {
 
                 let crash_ctx_buffer = &buf[..written];
             } else if #[cfg(target_os = "macos")] {
+                // The server reads the mach port only when told a crash context
+                // is coming, and this also orders it after every message sent
+                // before it over the socket
+                self.send_message_impl(super::MACH_CRASH, &[])?;
                 self.port.send_crash_context(
                     crash_context,
                     Some(std::time::Duration::from_secs(2)),

@@ -9,8 +9,6 @@ fn main() {
     if std::env::args().any(|a| a == "--server") {
         let mut server = Server::with_name(socket_name).expect("failed to create server");
 
-        let ab = std::sync::atomic::AtomicBool::new(false);
-
         struct Handler;
 
         impl minidumper::ServerHandler for Handler {
@@ -62,7 +60,7 @@ fn main() {
         }
 
         server
-            .run(Box::new(Handler), &ab, None)
+            .run(Box::new(Handler), None)
             .expect("failed to run server");
 
         return;
@@ -98,12 +96,8 @@ fn main() {
             // Before we request the crash, send a message to the server
             client.send_message(2, "mistakes were made").unwrap();
 
-            // Send a ping to the server, this ensures that all messages that have been sent
-            // are "flushed" before the crash event is sent. This is only really useful
-            // on macos where messages and crash events are sent via different, unsynchronized,
-            // methods which can result in the crash event closing the server before
-            // the non-crash messages are received/processed
-            client.ping().unwrap();
+            // The crash request is ordered after the messages sent before it on every
+            // platform, macOS's mach port included, so no ping is needed to flush them
 
             crash_handler::CrashEventResult::Handled(client.request_dump(crash_context).is_ok())
         })
