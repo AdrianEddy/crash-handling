@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On macOS `Client::request_dump` first tells the server over the socket that a crash context is on its way over the mach port, which the server reads only then. That also orders the crash after the messages sent before it, so a `Client::ping` before `request_dump` is no longer needed for that: a crash context that comes while the server waits for another client's is kept until its own client's word has been read. A client whose crash context doesn't come within 5 seconds of its word is disconnected.
 ### Fixed
 - On macOS a crash context from a process that died after sending it, or from a process with no connection to the server, no longer ends `Server::run` for every client: the first is dropped, and the second acknowledged with 0, as no minidump is written for it.
+- On macOS `Server::with_name` checks in the mach service before it binds the socket, so a client that connects in between no longer fails to find the service.
 ## [0.11.0] - 2026-07-20
 ### Changed
 - [PR#122](https://github.com/EmbarkStudios/crash-handling/pull/122) updated `minidump-writer` to 0.13 and `crash-context` to 0.8.0.

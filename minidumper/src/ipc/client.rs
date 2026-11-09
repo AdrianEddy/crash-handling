@@ -41,9 +41,9 @@ impl Client {
                 let SocketName::Path(path) = sn;
                 let socket = Stream::connect(path)?;
 
-                // Note that sun_path is limited to 108 characters including null,
+                // Note that sun_path is limited to 104 characters including null,
                 // while a mach port name is limited to 128 including null, so
-                // the length is already effectively checked here
+                // the connect above has already rejected a name too long for the port
                 let port_name = std::ffi::CString::new(path.to_str().ok_or(Error::InvalidPortName)?).map_err(|_err| Error::InvalidPortName)?;
                 let port = crash_context::ipc::Client::create(&port_name)?;
             } else {

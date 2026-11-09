@@ -643,3 +643,29 @@ fn crash_context_waits_for_its_announcement() {
         .expect("the server loop should return")
         .unwrap();
 }
+
+/// Tests that the mach service is checked in before the socket listens, so a
+/// client that can connect always finds the service: a server whose service
+/// name is taken fails without ever binding its socket
+#[cfg(target_os = "macos")]
+#[test]
+fn mach_service_before_socket() {
+    let path = std::path::Path::new("mach_service_before_socket");
+    let name = minidumper::SocketName::Path(path);
+
+    let first = minidumper::Server::with_name(name).unwrap();
+
+    // The second server removes the first one's socket file as it starts, and
+    // then can't check in the service the first one holds
+    let second = minidumper::Server::with_name(name);
+    assert!(
+        matches!(second, Err(minidumper::Error::PortError(_))),
+        "the service name is taken"
+    );
+    assert!(
+        !path.exists(),
+        "a server that couldn't check in its service never binds its socket"
+    );
+
+    drop(first);
+}
