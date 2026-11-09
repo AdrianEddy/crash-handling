@@ -6,7 +6,7 @@ pub use errors::Error;
 use std::{fs::File, path::PathBuf};
 
 mod ipc;
-pub use ipc::{Client, MAX_MESSAGE_SIZE, Server, ShutdownHandle, SocketName};
+pub use ipc::{Client, ClientTimeouts, MAX_MESSAGE_SIZE, Server, ShutdownHandle, SocketName};
 
 /// The result of a successful minidump generation.
 pub struct MinidumpBinary {

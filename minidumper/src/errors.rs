@@ -38,6 +38,14 @@ pub enum Error {
     Scroll(#[from] scroll::Error),
     #[error("protocol error occurred: {0}")]
     ProtocolError(&'static str),
+    /// The server didn't take a message, or didn't answer, within the
+    /// [`crate::ClientTimeouts`] the client was created with
+    #[error("the server didn't respond in time")]
+    TimedOut,
+    /// An earlier call on this client failed part way, which leaves the
+    /// connection out of step with the server, so it can't be used any more
+    #[error("the connection is out of step with the server after an earlier call failed")]
+    ConnectionBroken,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

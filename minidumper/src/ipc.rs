@@ -129,7 +129,7 @@ cfg_if::cfg_if! {
 mod client;
 mod server;
 
-pub use client::Client;
+pub use client::{Client, ClientTimeouts};
 pub use server::{Server, ShutdownHandle};
 
 const CRASH: u32 = 0;

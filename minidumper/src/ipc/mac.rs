@@ -155,6 +155,52 @@ impl Uds {
         }
     }
 
+    /// Sets `SO_SNDTIMEO` or `SO_RCVTIMEO`, where 0 is no timeout, as std's
+    /// sockets do
+    fn set_timeout(&self, timeout: Option<std::time::Duration>, kind: i32) -> io::Result<()> {
+        let timeout = match timeout {
+            Some(timeout) if timeout.is_zero() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot set a 0 duration timeout",
+                ));
+            }
+            Some(timeout) => {
+                let mut timeval = libc::timeval {
+                    tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+                    tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+                };
+
+                // Less than a microsecond is still a timeout, not none
+                if timeval.tv_sec == 0 && timeval.tv_usec == 0 {
+                    timeval.tv_usec = 1;
+                }
+
+                timeval
+            }
+            None => libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+        };
+
+        // SAFETY: syscall, given a timeval as the option's value
+        if unsafe {
+            libc::setsockopt(
+                self.0,
+                libc::SOL_SOCKET,
+                kind,
+                (&timeout as *const libc::timeval).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     /// Sets an `int` socket option
     fn set_int(&self, option: i32, value: libc::c_int) -> io::Result<()> {
         // SAFETY: syscall, given an int as the option's value
@@ -320,6 +366,20 @@ impl UnixStream {
     #[inline]
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.0.set_nonblocking(nonblocking)
+    }
+
+    /// Bounds how long a blocking read waits. A read that times out fails with
+    /// `EAGAIN`.
+    #[inline]
+    pub(crate) fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.0.set_timeout(timeout, libc::SO_RCVTIMEO)
+    }
+
+    /// Bounds how long a blocking send waits. A send that times out writes
+    /// part of its data, or fails with `EAGAIN` if it wrote none.
+    #[inline]
+    pub(crate) fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.0.set_timeout(timeout, libc::SO_SNDTIMEO)
     }
 
     /// Has the kernel write each send whole, however many threads send at once,

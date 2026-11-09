@@ -1058,3 +1058,159 @@ fn oversized_header_closes_connection() {
 
     assert!(messages.lock().is_empty(), "no message was delivered");
 }
+
+/// Limits short enough for a test, and far longer than a server that is
+/// serving takes to answer
+const TIMEOUTS: minidumper::ClientTimeouts = minidumper::ClientTimeouts {
+    send: Some(std::time::Duration::from_millis(500)),
+    recv: Some(std::time::Duration::from_millis(500)),
+};
+
+/// Tests that a client with timeouts works as any other with a server that
+/// serves
+#[test]
+fn timeouts_with_a_serving_server() {
+    let name = minidumper::SocketName::path("timeouts_with_a_serving_server");
+    let server = minidumper::Server::with_name(name).unwrap();
+    let shutdown = server.shutdown_handle();
+    let messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let returned = spawn_server(server, Box::new(Record(messages.clone())), None);
+
+    let client = minidumper::Client::with_timeouts(name, TIMEOUTS).unwrap();
+    client.send_message(3, "hello").unwrap();
+    client.ping().unwrap();
+
+    shutdown.shutdown().unwrap();
+    returned
+        .recv_timeout(RETURN_LIMIT)
+        .expect("the server loop should return")
+        .unwrap();
+
+    assert!(*messages.lock() == [(3, b"hello".to_vec())]);
+}
+
+/// Tests that a ping to a server that is alive but never answers, as one that
+/// is stopped or hung, times out, and that the connection is then unusable
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ping_times_out_on_a_server_that_never_answers() {
+    let name = minidumper::SocketName::path("ping_times_out");
+    // Listens, but never runs its loop
+    let _server = minidumper::Server::with_name(name).unwrap();
+
+    let client = minidumper::Client::with_timeouts(name, TIMEOUTS).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(client.ping(), Err(minidumper::Error::TimedOut)));
+    assert!(started.elapsed() < RETURN_LIMIT);
+
+    assert!(
+        matches!(client.ping(), Err(minidumper::Error::ConnectionBroken)),
+        "a late answer could still come, so the connection is out of step"
+    );
+    assert!(matches!(
+        client.send_message(1, "late"),
+        Err(minidumper::Error::ConnectionBroken)
+    ));
+}
+
+/// Tests that a dump request to a server that is alive but never answers times
+/// out, where it used to wait for as long as the server didn't serve
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn dump_request_times_out_on_a_server_that_never_answers() {
+    let name = minidumper::SocketName::path("dump_request_times_out");
+    // Listens, but never runs its loop, so no minidump is ever written
+    let _server = minidumper::Server::with_name(name).unwrap();
+
+    cfg_if::cfg_if! {
+        if #[cfg(any(target_os = "linux", target_os = "android"))] {
+            let context = crash_context::CrashContext::from_bytes(
+                &[0; std::mem::size_of::<crash_context::CrashContext>()],
+            )
+            .unwrap();
+        } else if #[cfg(target_os = "windows")] {
+            let context = crash_context::CrashContext {
+                exception_pointers: std::ptr::null(),
+                exception_code: 0,
+                process_id: std::process::id(),
+                thread_id: 0,
+            };
+        }
+    }
+
+    let client = minidumper::Client::with_timeouts(name, TIMEOUTS).unwrap();
+    assert!(matches!(
+        client.request_dump(&context),
+        Err(minidumper::Error::TimedOut)
+    ));
+    assert!(matches!(
+        client.request_dump(&context),
+        Err(minidumper::Error::ConnectionBroken)
+    ));
+}
+
+/// Tests that the connect of a client with timeouts times out against a macOS
+/// server that never answers: the server acknowledges each client's pid there
+#[cfg(target_os = "macos")]
+#[test]
+fn connect_times_out_on_a_server_that_never_answers() {
+    let name = minidumper::SocketName::path("connect_times_out");
+    // Listens, but never runs its loop
+    let _server = minidumper::Server::with_name(name).unwrap();
+
+    assert!(matches!(
+        minidumper::Client::with_timeouts(name, TIMEOUTS),
+        Err(minidumper::Error::TimedOut)
+    ));
+}
+
+/// Tests that sends to a server that is alive but never reads time out once
+/// the socket is full, where they used to block for as long as the server
+/// didn't read
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn send_times_out_on_a_server_that_never_reads() {
+    let name = minidumper::SocketName::path("send_times_out");
+    // Listens, but never runs its loop
+    let _server = minidumper::Server::with_name(name).unwrap();
+
+    let client = minidumper::Client::with_timeouts(name, TIMEOUTS).unwrap();
+    let message = vec![0u8; 32 * 1024];
+
+    // The socket's buffer takes some, and a send then waits for room that
+    // never comes. Far more than any OS buffers, to fail rather than hang.
+    let result = (0..1024)
+        .map(|_| client.send_message(1, &message))
+        .find(Result::is_err);
+    assert!(
+        matches!(result, Some(Err(minidumper::Error::TimedOut))),
+        "a full socket times the send out"
+    );
+    assert!(matches!(
+        client.send_message(1, &message),
+        Err(minidumper::Error::ConnectionBroken)
+    ));
+}
+
+/// Tests that a timeout under a millisecond is refused: the OS would take a
+/// zero one for no timeout, and the mach port's limits are whole milliseconds,
+/// which would make a shorter one not wait at all
+#[test]
+fn timeout_under_a_millisecond_is_refused() {
+    let name = minidumper::SocketName::path("timeout_under_a_millisecond_is_refused");
+    let _server = minidumper::Server::with_name(name).unwrap();
+
+    for short in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_micros(999),
+    ] {
+        let timeouts = minidumper::ClientTimeouts {
+            send: None,
+            recv: Some(short),
+        };
+        assert!(
+            minidumper::Client::with_timeouts(name, timeouts).is_err(),
+            "{short:?}"
+        );
+    }
+}

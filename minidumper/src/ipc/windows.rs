@@ -76,6 +76,10 @@ mod bindings {
     pub type WSA_ERROR = i32;
     pub const WSAESHUTDOWN: WSA_ERROR = 10058;
 
+    pub const SOL_SOCKET: i32 = 0xffff;
+    pub const SO_SNDTIMEO: i32 = 0x1005;
+    pub const SO_RCVTIMEO: i32 = 0x1006;
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub fn SetHandleInformation(hObject: HANDLE, dwMask: u32, dwFlags: HANDLE_FLAGS) -> BOOL;
@@ -112,6 +116,13 @@ mod bindings {
         pub fn bind(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
         pub fn listen(s: SOCKET, backlog: i32) -> i32;
         pub fn connect(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
+        pub fn setsockopt(
+            s: SOCKET,
+            level: i32,
+            optname: i32,
+            optval: *const u8,
+            optlen: i32,
+        ) -> i32;
     }
 }
 
@@ -240,6 +251,40 @@ impl Socket {
         // SAFETY: syscall
         let r = unsafe { bindings::ioctlsocket(self.0, bindings::FIONBIO, &mut nonblocking) };
         if r == 0 {
+            Ok(())
+        } else {
+            Err(last_socket_error())
+        }
+    }
+
+    /// Sets `SO_SNDTIMEO` or `SO_RCVTIMEO`, in milliseconds, rounded up, where 0
+    /// is no timeout, as std's sockets do
+    fn set_timeout(&self, timeout: Option<std::time::Duration>, kind: i32) -> io::Result<()> {
+        let millis: u32 = match timeout {
+            Some(timeout) if timeout.is_zero() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot set a 0 duration timeout",
+                ));
+            }
+            Some(timeout) => {
+                let millis = timeout.as_nanos().div_ceil(1_000_000);
+                u32::try_from(millis).unwrap_or(u32::MAX)
+            }
+            None => 0,
+        };
+
+        // SAFETY: syscall, given a DWORD as the option's value
+        if unsafe {
+            bindings::setsockopt(
+                self.0,
+                bindings::SOL_SOCKET,
+                kind,
+                (&millis as *const u32).cast(),
+                std::mem::size_of::<u32>() as i32,
+            )
+        } == 0
+        {
             Ok(())
         } else {
             Err(last_socket_error())
@@ -475,6 +520,20 @@ impl UnixStream {
     #[inline]
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.0.set_nonblocking(nonblocking)
+    }
+
+    /// Bounds how long a blocking read waits. A read that times out fails with
+    /// `WSAETIMEDOUT`, after which the connection is in an indeterminate state.
+    #[inline]
+    pub(crate) fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.0.set_timeout(timeout, bindings::SO_RCVTIMEO)
+    }
+
+    /// Bounds how long a blocking send waits. A send that times out fails with
+    /// `WSAETIMEDOUT`, after which the connection is in an indeterminate state.
+    #[inline]
+    pub(crate) fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.0.set_timeout(timeout, bindings::SO_SNDTIMEO)
     }
 
     #[inline]
