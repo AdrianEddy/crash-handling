@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Fixed
+- On Linux and Android the crash context's `siginfo` is now converted from the signal's `siginfo_t` as the kernel's own `signalfd` converts it (pointers zero-extended, as a 64-bit kernel's `signalfd` gives them to a 32-bit process), where the `siginfo_t`'s bytes were copied as they were, though the two structs share only their first three fields. Every fault's `ssi_addr`, which minidump-writer writes as the crash address, read 0, and the address landed in `ssi_uid` and `ssi_fd` instead; `ssi_pid` was never set. `CrashHandler::simulate_signal` now hands the handler a `siginfo_t` as the kernel does for a signal a process sends itself.
 ## [0.8.1] - 2026-09-25
 ### Fixed
 - [PR#124](https://github.com/EmbarkStudios/crash-handling/pull/124) added code to allow crash handling to interact better with sanitizers. It requires the nightly [`linkage`](https://github.com/rust-lang/rust/issues/29603) feature, just as sanitizers require nightly, so this code is gated behind the `sanitizer_compat` cfg that must be passed via rustflags.

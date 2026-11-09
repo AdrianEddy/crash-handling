@@ -1,4 +1,5 @@
 pub mod jmp;
+mod siginfo;
 mod state;
 
 use crate::Error;
@@ -88,10 +89,10 @@ impl CrashHandler {
         // uphold any guarantees on their end, so no real need to declare the
         // function itself unsafe.
         unsafe {
-            let mut siginfo: libc::signalfd_siginfo = std::mem::zeroed();
-            siginfo.ssi_signo = signal;
-            siginfo.ssi_code = state::SI_USER;
-            siginfo.ssi_pid = std::process::id();
+            // What the kernel hands the handler for a signal this process sends
+            // itself
+            let mut siginfo =
+                siginfo::kill_siginfo(signal as i32, std::process::id() as i32, libc::getuid());
 
             let mut context = std::mem::zeroed();
             crash_context::crash_context_getcontext(&mut context);
@@ -99,7 +100,7 @@ impl CrashHandler {
             let lock = state::HANDLER.lock();
             if let Some(handler) = &*lock {
                 handler.handle_signal(
-                    &mut *(&mut siginfo as *mut libc::signalfd_siginfo).cast::<libc::siginfo_t>(),
+                    &mut siginfo,
                     &mut *(&mut context as *mut crash_context::ucontext_t).cast::<libc::c_void>(),
                 )
             } else {

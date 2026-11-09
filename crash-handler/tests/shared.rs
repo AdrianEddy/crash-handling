@@ -30,9 +30,17 @@ pub fn handles_crash(flavor: SadnessFlavor) {
 
                         //assert_eq!(cc.tid, tid);
 
-                        // At least on linux these...aren't set. Which is weird
-                        //assert_eq!(cc.siginfo.ssi_pid, std::process::id());
-                        //assert_eq!(cc.siginfo.ssi_tid, tid as u32);
+                        match flavor {
+                            // A fault carries its address
+                            SadnessFlavor::Segfault => {
+                                assert_eq!(cc.siginfo.ssi_addr, sadness_generator::SEGFAULT_ADDRESS as _);
+                            }
+                            // `abort` raises the signal with `tgkill`, which carries the sender
+                            SadnessFlavor::Abort => {
+                                assert_eq!(cc.siginfo.ssi_pid, std::process::id());
+                            }
+                            _ => {}
+                        }
                     } else if #[cfg(target_os = "macos")] {
                         use ch::ExceptionType;
 

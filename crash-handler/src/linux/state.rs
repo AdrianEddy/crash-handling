@@ -17,9 +17,6 @@ const fn get_stack_size() -> usize {
 /// which is (hopefully) exceedingly rare
 const SIG_STACK_SIZE: usize = get_stack_size();
 
-/// kill
-pub(crate) const SI_USER: i32 = 0;
-
 struct StackSave {
     old: Option<libc::stack_t>,
     new: libc::stack_t,
@@ -425,12 +422,11 @@ impl HandlerInner {
         uc: &mut libc::c_void,
     ) -> crate::CrashEventResult {
         unsafe {
-            // The siginfo_t in libc is lowest common denominator, but this code is
-            // specifically targeting linux/android, which contains the si_pid field
-            // that we require
-            let nix_info = &*((info as *const libc::siginfo_t).cast::<libc::signalfd_siginfo>());
+            // The crash context holds the signal's info in signalfd's form,
+            // which shares only its first three fields with `siginfo_t`
+            let ssi = super::siginfo::signalfd_siginfo(info);
 
-            debug_print!("acquired siginfo");
+            debug_print!("converted siginfo");
 
             // Allow ourselves to be dumped, if that is what the user handler wishes to do
             let _set_dumpable = SetDumpable::new(self.dump_process);
@@ -443,7 +439,7 @@ impl HandlerInner {
                 ptr::write_bytes(cc.deref_mut(), 0, 1);
                 debug_print!("zeroed crashctx");
 
-                ptr::copy_nonoverlapping(nix_info, &mut cc.siginfo, 1);
+                cc.siginfo = ssi;
                 debug_print!("copied siginfo");
 
                 let uc_ptr = &*(uc as *const libc::c_void).cast::<crash_context::ucontext_t>();
